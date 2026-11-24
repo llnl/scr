@@ -98,6 +98,7 @@
 #include "scr_cache.h"
 #include "scr_cache_rebuild.h"
 #include "scr_prefix.h"
+#include "scr_lustre_load.h"
 #include "scr_fetch.h"
 #include "scr_flush.h"
 #include "scr_flush_sync.h"
@@ -199,6 +200,12 @@ extern int scr_crc_on_delete; /* whether to enable crc32 checks when deleting ch
 extern int    scr_checkpoint_interval;   /* times to call Need_checkpoint between checkpoints */
 extern int    scr_checkpoint_seconds;    /* min number of seconds between checkpoints */
 extern double scr_checkpoint_overhead;   /* max allowed overhead for checkpointing */
+
+extern int    scr_lustre_load;             /* defer checkpoints while Lustre is busy */
+extern double scr_lustre_load_threshold;   /* percent of peak load that is busy */
+extern int    scr_lustre_load_max_skip;    /* max deferrals of one checkpoint or flush */
+extern int    scr_lustre_load_max_seconds; /* max seconds to defer one checkpoint */
+extern int    scr_lustre_load_interval;    /* min seconds between load queries */
 extern int    scr_need_checkpoint_count; /* tracks the number of times Need_checkpoint has been called */
 extern double scr_time_checkpoint_total; /* keeps a running total of the time spent to checkpoint */
 extern int    scr_time_checkpoint_count; /* keeps a running count of the number of checkpoints taken */

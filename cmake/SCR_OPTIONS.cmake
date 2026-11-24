@@ -49,6 +49,9 @@ MESSAGE(STATUS "ENABLE_IBM_BBAPI: ${ENABLE_IBM_BBAPI}")
 OPTION(ENABLE_CRAY_DW "Whether to enable Cray Datawarp support" OFF)
 MESSAGE(STATUS "ENABLE_CRAY_DW: ${ENABLE_CRAY_DW}")
 
+OPTION(ENABLE_LUSTRE "Whether to defer checkpoints while Lustre is busy (experimental)" OFF)
+MESSAGE(STATUS "ENABLE_LUSTRE: ${ENABLE_LUSTRE}")
+
 # define CMAKE_INSTALL_SYSCONFDIR for SCR_CONFIG_FILE path
 INCLUDE(GNUInstallDirs)
 

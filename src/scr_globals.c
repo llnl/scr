@@ -145,6 +145,12 @@ int scr_crc_on_delete = SCR_CRC_ON_DELETE; /* whether to enable crc32 checks whe
 int    scr_checkpoint_interval = SCR_CHECKPOINT_INTERVAL; /* times to call Need_checkpoint between checkpoints */
 int    scr_checkpoint_seconds  = SCR_CHECKPOINT_SECONDS;  /* min number of seconds between checkpoints */
 double scr_checkpoint_overhead = SCR_CHECKPOINT_OVERHEAD; /* max allowed overhead for checkpointing */
+
+int    scr_lustre_load             = SCR_LUSTRE_LOAD;             /* defer checkpoints while Lustre is busy */
+double scr_lustre_load_threshold   = SCR_LUSTRE_LOAD_THRESHOLD;   /* percent of peak load that is busy */
+int    scr_lustre_load_max_skip    = SCR_LUSTRE_LOAD_MAX_SKIP;    /* max deferrals of one checkpoint or flush */
+int    scr_lustre_load_max_seconds = SCR_LUSTRE_LOAD_MAX_SECONDS; /* max seconds to defer one checkpoint */
+int    scr_lustre_load_interval    = SCR_LUSTRE_LOAD_INTERVAL;    /* min seconds between load queries */
 int    scr_need_checkpoint_count = 0;   /* tracks the number of times Need_checkpoint has been called */
 double scr_time_checkpoint_total = 0.0; /* keeps a running total of the time spent to checkpoint */
 int    scr_time_checkpoint_count = 0;   /* keeps a running count of the number of checkpoints taken */
