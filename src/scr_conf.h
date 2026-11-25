@@ -285,6 +285,34 @@
 #define SCR_CHECKPOINT_OVERHEAD (0)
 #endif
 
+/* whether to defer checkpoints and flushes while the Lustre filesystem
+ * holding the prefix directory is busy, set to 0 to disable */
+#ifndef SCR_LUSTRE_LOAD
+#define SCR_LUSTRE_LOAD (0)
+#endif
+
+/* the filesystem is busy if its load is at least this percent of the
+ * recent peak of its targets, the default is the top quartile */
+#ifndef SCR_LUSTRE_LOAD_THRESHOLD
+#define SCR_LUSTRE_LOAD_THRESHOLD (75)
+#endif
+
+/* max calls to SCR_Need_checkpoint (or flushes) to defer while busy */
+#ifndef SCR_LUSTRE_LOAD_MAX_SKIP
+#define SCR_LUSTRE_LOAD_MAX_SKIP (10)
+#endif
+
+/* max seconds to defer a checkpoint while busy, set to 0 for no limit */
+#ifndef SCR_LUSTRE_LOAD_MAX_SECONDS
+#define SCR_LUSTRE_LOAD_MAX_SECONDS (0)
+#endif
+
+/* min seconds between queries of the filesystem load, each query sends
+ * one statfs RPC to every target */
+#ifndef SCR_LUSTRE_LOAD_INTERVAL
+#define SCR_LUSTRE_LOAD_INTERVAL (5)
+#endif
+
 /* =========================================================================
  * The following applies to scr_io operations
  * ========================================================================= */

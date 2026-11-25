@@ -561,6 +561,34 @@ The table in this section specifies the full set of SCR configuration parameters
    * - :code:`SCR_CHECKPOINT_OVERHEAD`
      - 0.0
      - Set to positive floating-point value to specify maximum percent overhead allowed for checkpointing operations as guided by :code:`SCR_Need_checkpoint`.
+   * - :code:`SCR_LUSTRE_LOAD`
+     - 0
+     - Experimental.  Set to 1 to defer checkpoints and checkpoint flushes while the Lustre filesystem holding :code:`SCR_PREFIX` is busy.
+       When :code:`SCR_Need_checkpoint` would return 1, but the bandwidth or RPC rate of the Lustre targets is expected to be
+       at least :code:`SCR_LUSTRE_LOAD_THRESHOLD` percent of their recent peak, it returns 0 instead,
+       and returns 1 at the first later call when the load has dropped, or when the limits below are reached.
+       The expected load is the current load plus its trend since the previous query, which is made at the call before
+       the checkpoint is due, or earlier if the calls are less than :code:`SCR_LUSTRE_LOAD_INTERVAL` seconds apart.
+       A checkpoint is never deferred when a halt condition is active.
+       This needs SCR built with :code:`-DENABLE_LUSTRE=ON` against a Lustre client, and Lustre servers,
+       that return the target load in statfs (shown by :code:`lfs df --stats`, see
+       https://jira.whamcloud.com/browse/LU-7880), otherwise it has no effect.
+   * - :code:`SCR_LUSTRE_LOAD_THRESHOLD`
+     - 75
+     - Percent of the recent peak load of the Lustre targets at or above which the filesystem is busy.
+       The peak is the highest load that the targets recently sustained, so the default defers checkpoints
+       while the load is in the top quartile.
+   * - :code:`SCR_LUSTRE_LOAD_MAX_SKIP`
+     - 10
+     - Maximum number of consecutive calls to :code:`SCR_Need_checkpoint`, or checkpoint flushes,
+       that may be deferred before a checkpoint or flush is done regardless of the load.
+   * - :code:`SCR_LUSTRE_LOAD_MAX_SECONDS`
+     - 0
+     - If positive, maximum number of seconds to defer one checkpoint, regardless of :code:`SCR_LUSTRE_LOAD_MAX_SKIP`.
+   * - :code:`SCR_LUSTRE_LOAD_INTERVAL`
+     - 5
+     - Minimum seconds between queries of the Lustre target load.
+       Each query sends one statfs RPC to every MDT and OST, and the servers update their load at most once per second.
    * - :code:`SCR_CNTL_BASE`
      - :code:`/dev/shm`
      - Specify the default base directory SCR should use to store its runtime control metadata.  The control directory should be in fast, node-local storage like RAM disk.

@@ -39,6 +39,7 @@ LIST(APPEND libscr_srcs
     scr_index_api.c
     scr_io.c
     scr_log.c
+    scr_lustre_load.c
     scr_meta.c
     scr_param.c
     scr_prefix.c

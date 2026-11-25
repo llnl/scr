@@ -407,7 +407,240 @@ Utility functions
 */
 
 /* flush the specified dataset id if needed */
-static int scr_check_flush_id(scr_cache_index* cindex, int id)
+/*
+=========================================
+Defer checkpoints and flushes while Lustre is busy
+=========================================
+*/
+
+/* state of a checkpoint deferred by SCR_Need_checkpoint, on rank 0 */
+static int    scr_ckpt_deferred    = 0;   /* a checkpoint is due */
+static int    scr_ckpt_defer_count = 0;   /* times it was deferred */
+static double scr_ckpt_defer_start = 0.0; /* when it was first deferred */
+
+/* state of a deferred checkpoint flush, on all ranks */
+static int    scr_flush_deferred    = 0;  /* a flush is due */
+static int    scr_flush_defer_count = 0;  /* times it was deferred */
+
+/* rank 0: the latest two samples of the Lustre load, the older one is
+ * usually taken one step before a checkpoint is due, to see the trend */
+static scr_lustre_load_info scr_lustre_cur;
+static scr_lustre_load_info scr_lustre_prev;
+static double scr_lustre_cur_time  = 0.0; /* when scr_lustre_cur was taken */
+static double scr_lustre_prev_time = 0.0; /* 0 if scr_lustre_prev is unset */
+static int    scr_lustre_valid     = 0;   /* scr_lustre_cur holds a sample */
+
+/* the load is a decaying average that shows 90% of a change in about 30s,
+ * so the trend is not extrapolated further ahead than that */
+#define SCR_LUSTRE_TREND_MAX (30.0)
+
+/* rank 0: query the load, unless it was queried less than
+ * SCR_LUSTRE_LOAD_INTERVAL seconds ago, since each query sends one statfs
+ * RPC to every target (with some slack for uneven step times) */
+static void scr_lustre_sample(void)
+{
+  scr_lustre_load_info load;
+  double now = MPI_Wtime();
+
+  if (scr_lustre_cur_time > 0.0 &&
+      now - scr_lustre_cur_time < 0.8 * scr_lustre_load_interval)
+  {
+    return;
+  }
+
+  if (scr_lustre_load_get(&load) != SCR_SUCCESS) {
+    scr_lustre_valid     = 0;
+    scr_lustre_prev_time = 0.0;
+    scr_lustre_cur_time  = now;
+    return;
+  }
+
+  if (scr_lustre_valid) {
+    scr_lustre_prev      = scr_lustre_cur;
+    scr_lustre_prev_time = scr_lustre_cur_time;
+  }
+  scr_lustre_cur      = load;
+  scr_lustre_cur_time = now;
+  scr_lustre_valid    = 1;
+}
+
+/* rank 0: whether the filesystem holding the prefix directory is busy,
+ * meaning that for any kind of load, the current load plus its recent
+ * trend is at least SCR_LUSTRE_LOAD_THRESHOLD percent of the recent peak
+ * of its targets.  A load that is high but falling fast is not busy, and
+ * a load that is rising fast is busy before it reaches the threshold. */
+static int scr_lustre_busy(void)
+{
+  static const char* names[SCR_LUSTRE_NR] = { "bw", "ops", "md_ops" };
+  double gap = 0.0;
+  int busy = 0;
+  int k;
+
+  scr_lustre_sample();
+
+  /* if the load can't be read, don't hold up checkpoints */
+  if (!scr_lustre_valid) {
+    return 0;
+  }
+
+  if (scr_lustre_prev_time > 0.0) {
+    gap = scr_lustre_cur_time - scr_lustre_prev_time;
+  }
+
+  for (k = 0; k < SCR_LUSTRE_NR; k++) {
+    double cur  = scr_lustre_cur.cur[k];
+    double peak = scr_lustre_cur.peak[k];
+    double next = cur;
+
+    if (peak <= 0.0) {
+      continue;
+    }
+
+    /* extrapolate the change since the previous sample over the same
+     * time again, as the load expected while the checkpoint is written */
+    if (gap > 0.0) {
+      double slope = (cur - scr_lustre_prev.cur[k]) / gap;
+      next = cur + slope * (gap < SCR_LUSTRE_TREND_MAX ? gap : SCR_LUSTRE_TREND_MAX);
+      if (next < 0.0) {
+        next = 0.0;
+      }
+    }
+
+    if (next * 100.0 >= scr_lustre_load_threshold * peak) {
+      busy = 1;
+    }
+    scr_dbg(2, "SCR_LUSTRE_LOAD: %s %.0f%% of peak, was %.0f%% %.0fs ago, expect %.0f%%",
+      names[k], cur * 100.0 / peak,
+      gap > 0.0 ? scr_lustre_prev.cur[k] * 100.0 / peak : -1.0, gap,
+      next * 100.0 / peak
+    );
+  }
+
+  scr_dbg(2, "SCR_LUSTRE_LOAD: %d targets: %s",
+    scr_lustre_cur.targets, busy ? "busy" : "not busy"
+  );
+
+  return busy;
+}
+
+/* rank 0: estimate of the seconds between calls to SCR_Need_checkpoint */
+static double scr_lustre_step = 0.0;
+static double scr_lustre_step_last = 0.0;
+
+/* rank 0: called by SCR_Need_checkpoint when no checkpoint is due now,
+ * queries the load at the last call at least SCR_LUSTRE_LOAD_INTERVAL
+ * seconds before the next checkpoint is due, usually one step before it,
+ * so that the trend of the load is known when the checkpoint is due */
+static void scr_lustre_prefetch(int count)
+{
+  double now = MPI_Wtime();
+  double until = -1.0;
+  double gap = scr_lustre_load_interval;
+
+  if (scr_lustre_step <= 0.0) {
+    return;
+  }
+
+  /* time until the next checkpoint is due */
+  if (scr_checkpoint_interval > 0) {
+    int steps = scr_checkpoint_interval - count % scr_checkpoint_interval;
+    until = steps * scr_lustre_step;
+  }
+  if (scr_checkpoint_seconds > 0) {
+    double left = scr_checkpoint_seconds - (now - scr_time_checkpoint_end);
+    if (until < 0.0 || left < until) {
+      until = left;
+    }
+  }
+  if (until < 0.0) {
+    return;
+  }
+
+  /* the next call is too close to the checkpoint to query again before it */
+  if (until >= gap && until - scr_lustre_step < gap) {
+    scr_dbg(2, "SCR_LUSTRE_LOAD: checkpoint due in %.0f seconds", until);
+    scr_lustre_sample();
+  }
+}
+
+/* rank 0: track the time between calls to SCR_Need_checkpoint */
+static void scr_lustre_step_update(void)
+{
+  double now = MPI_Wtime();
+
+  if (scr_lustre_step_last > 0.0) {
+    double step = now - scr_lustre_step_last;
+    scr_lustre_step = scr_lustre_step > 0.0 ?
+      0.75 * scr_lustre_step + 0.25 * step : step;
+  }
+  scr_lustre_step_last = now;
+}
+
+/* rank 0: whether a checkpoint that is due may be taken now, or should
+ * be deferred because Lustre is busy */
+static int scr_lustre_ckpt_allowed(void)
+{
+  double now = MPI_Wtime();
+
+  if (scr_lustre_busy()) {
+    if (!scr_ckpt_deferred) {
+      scr_ckpt_deferred    = 1;
+      scr_ckpt_defer_count = 0;
+      scr_ckpt_defer_start = now;
+    }
+
+    if (scr_ckpt_defer_count < scr_lustre_load_max_skip &&
+        (scr_lustre_load_max_seconds <= 0 ||
+         now - scr_ckpt_defer_start < scr_lustre_load_max_seconds))
+    {
+      scr_ckpt_defer_count++;
+      scr_dbg(1, "Deferring checkpoint while Lustre is busy (%d of %d)",
+        scr_ckpt_defer_count, scr_lustre_load_max_skip
+      );
+      return 0;
+    }
+
+    scr_dbg(1, "Taking checkpoint after deferring it %d times for %.0f seconds",
+      scr_ckpt_defer_count, now - scr_ckpt_defer_start
+    );
+  }
+
+  scr_ckpt_deferred = 0;
+  return 1;
+}
+
+/* collective: whether a checkpoint flush that is due should be deferred
+ * because Lustre is busy, the dataset stays in cache until a later flush */
+static int scr_lustre_flush_defer(void)
+{
+  int defer = 0;
+
+  if (scr_my_rank_world == 0 && scr_lustre_busy() &&
+      scr_flush_defer_count < scr_lustre_load_max_skip)
+  {
+    defer = 1;
+  }
+  MPI_Bcast(&defer, 1, MPI_INT, 0, scr_comm_world);
+
+  if (defer) {
+    scr_flush_deferred = 1;
+    scr_flush_defer_count++;
+    if (scr_my_rank_world == 0) {
+      scr_dbg(1, "Deferring flush while Lustre is busy (%d of %d)",
+        scr_flush_defer_count, scr_lustre_load_max_skip
+      );
+    }
+  } else {
+    scr_flush_deferred = 0;
+    scr_flush_defer_count = 0;
+  }
+
+  return defer;
+}
+
+/* flush dataset id if needed, allow_defer is set when called collectively
+ * after a new dataset completes and a checkpoint flush may be deferred */
+static int scr_check_flush_id(scr_cache_index* cindex, int id, int allow_defer)
 {
   /* assume we don't have to flush */
   int need_flush = 0;
@@ -434,6 +667,22 @@ static int scr_check_flush_id(scr_cache_index* cindex, int id)
       if (ckpt_id > 0 && ckpt_id % scr_flush == 0) {
         need_flush = 1;
       }
+
+      /* a checkpoint flush that was deferred while Lustre was busy is
+       * done with this newer checkpoint instead */
+      if (scr_flush_deferred) {
+        need_flush = 1;
+      }
+    }
+  }
+
+  /* output must always be flushed, and datasets that bypass the cache
+   * are already on the parallel filesystem */
+  if (need_flush && allow_defer && scr_lustre_load && !is_output) {
+    int bypass = 0;
+    scr_cache_index_get_bypass(cindex, id, &bypass);
+    if (!bypass && scr_lustre_flush_defer()) {
+      need_flush = 0;
     }
   }
 
@@ -463,7 +712,7 @@ static int scr_check_flush_id(scr_cache_index* cindex, int id)
 /* check whether a flush is needed, and execute flush if so */
 static int scr_check_flush(scr_cache_index* cindex)
 {
-  int rc= scr_check_flush_id(cindex, scr_dataset_id);
+  int rc= scr_check_flush_id(cindex, scr_dataset_id, 1);
   return rc;
 }
 
@@ -503,7 +752,7 @@ int scr_flush_restart(scr_cache_index* cindex)
       }
     } else {
       /* otherwise, flush only if we need to flush */
-      scr_check_flush_id(cindex, id);
+      scr_check_flush_id(cindex, id, 0);
     }
   }
 
@@ -1273,6 +1522,35 @@ static int scr_get_params()
   }
   if (scr_my_rank_world == 0) {
     scr_dbg(1, "SCR_CHECKPOINT_OVERHEAD=%f", scr_checkpoint_overhead);
+  }
+
+  /* defer checkpoints and flushes while Lustre is busy */
+  if ((value = scr_param_get("SCR_LUSTRE_LOAD")) != NULL) {
+    scr_lustre_load = atoi(value);
+  }
+  if ((value = scr_param_get("SCR_LUSTRE_LOAD_THRESHOLD")) != NULL) {
+    if (scr_atod(value, &d) == SCR_SUCCESS && d >= 0.0) {
+      scr_lustre_load_threshold = d;
+    } else {
+      scr_err("Failed to read SCR_LUSTRE_LOAD_THRESHOLD successfully @ %s:%d",
+        __FILE__, __LINE__
+      );
+    }
+  }
+  if ((value = scr_param_get("SCR_LUSTRE_LOAD_MAX_SKIP")) != NULL) {
+    scr_lustre_load_max_skip = atoi(value);
+  }
+  if ((value = scr_param_get("SCR_LUSTRE_LOAD_MAX_SECONDS")) != NULL) {
+    scr_lustre_load_max_seconds = atoi(value);
+  }
+  if ((value = scr_param_get("SCR_LUSTRE_LOAD_INTERVAL")) != NULL) {
+    scr_lustre_load_interval = atoi(value);
+  }
+  if (scr_my_rank_world == 0) {
+    scr_dbg(1, "SCR_LUSTRE_LOAD=%d THRESHOLD=%f MAX_SKIP=%d MAX_SECONDS=%d INTERVAL=%d",
+      scr_lustre_load, scr_lustre_load_threshold, scr_lustre_load_max_skip,
+      scr_lustre_load_max_seconds, scr_lustre_load_interval
+    );
   }
 
   if (scr_debug > 0 && scr_my_rank_world == 0) {
@@ -2332,6 +2610,17 @@ int SCR_Init()
     }
   }
 
+  /* find the Lustre targets holding the prefix directory, and disable
+   * load checks on all ranks if their load can't be read */
+  if (scr_lustre_load) {
+    if (scr_my_rank_world == 0 &&
+        scr_lustre_load_init(scr_prefix) != SCR_SUCCESS)
+    {
+      scr_lustre_load = 0;
+    }
+    MPI_Bcast(&scr_lustre_load, 1, MPI_INT, 0, scr_comm_world);
+  }
+
   /* register this job in the logging database */
   if (scr_my_rank_world == 0 && scr_log_enable) {
     if (scr_username != NULL && scr_prefix != NULL) {
@@ -2629,6 +2918,10 @@ int SCR_Finalize()
   /* disconnect from database */
   if (scr_my_rank_world == 0 && scr_log_enable) {
     scr_log_finalize();
+  }
+
+  if (scr_my_rank_world == 0 && scr_lustre_load) {
+    scr_lustre_load_finalize();
   }
 
   /* shut down the AXL library */
@@ -3090,8 +3383,10 @@ int SCR_Need_checkpoint(int* flag)
 
   /* check whether a halt condition is active (don't halt,
    * just be sure to return 1 in this case) */
+  int halt = 0;
   if (!*flag && scr_bool_check_halt_and_decrement(SCR_TEST_BUT_DONT_HALT, 0)) {
     *flag = 1;
+    halt = 1;
   }
 
   /* have rank 0 make the decision and broadcast the result */
@@ -3134,6 +3429,22 @@ int SCR_Need_checkpoint(int* flag)
         if (percent_cost < scr_checkpoint_overhead) {
           *flag = 1;
         }
+      }
+    }
+
+    /* a checkpoint deferred while Lustre was busy is still due, since
+     * the conditions above may not trigger again for a while */
+    if (!*flag && scr_ckpt_deferred) {
+      *flag = 1;
+    }
+
+    /* defer the checkpoint while Lustre is busy, but never before a halt */
+    if (scr_lustre_load) {
+      scr_lustre_step_update();
+      if (*flag && !halt) {
+        *flag = scr_lustre_ckpt_allowed();
+      } else if (!*flag) {
+        scr_lustre_prefetch(scr_need_checkpoint_count);
       }
     }
   }

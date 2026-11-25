@@ -13,6 +13,7 @@
 // Optional Libs
 #cmakedefine HAVE_LIBYOGRT
 #cmakedefine HAVE_LIBMYSQLCLIENT
+#cmakedefine HAVE_LUSTRE_PERFSTATS
 
 // Build Options
 #cmakedefine HAVE_FORTRAN_API
